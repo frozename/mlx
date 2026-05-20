@@ -13,23 +13,51 @@ void init() {}
 
 void new_stream(Stream s) {
   assert(s.device == Device::gpu);
+  // Defensive: if `s.index` is being reused after a prior stream was torn
+  // down, drop any stale error that may have been stashed against this
+  // index but never consumed. Prevents cross-stream error attribution
+  // when callers create / destroy / recreate streams.
+  scheduler::clear_stream_error(s);
   auto& encoders = metal::get_command_encoders();
   auto& d = metal::device(s.device);
   encoders.try_emplace(s.index, d, s.index, d.residency_set());
 }
 
-inline void check_error(MTL::CommandBuffer* cbuf) {
-  if (cbuf->status() == MTL::CommandBufferStatusError) {
-    std::ostringstream msg;
-    msg << "[METAL] Command buffer execution failed: "
-        << cbuf->error()->localizedDescription()->utf8String();
-    throw std::runtime_error(msg.str());
+// Capture a Metal command-buffer error into a stash on the owning stream
+// instead of throwing. Metal completion handlers run on
+// `com.Metal.CompletionQueueDispatch` (libdispatch); a C++ exception thrown
+// across a dispatch block aborts the process unrecoverably. The stash is
+// re-thrown on the caller thread at the next sync waitpoint (eval / finalize
+// / CommandEncoder::synchronize). See mlx-explore/mlx#2670.
+//
+// Must be called before any task-completion notification so a thread that
+// wakes on `notify_task_completion` is guaranteed to see the error already
+// stashed when it next reaches a `throw_if_stream_error` waitpoint.
+inline void check_error(Stream s, MTL::CommandBuffer* cbuf) {
+  if (cbuf->status() != MTL::CommandBufferStatusError) {
+    return;
   }
+  std::ostringstream msg;
+  msg << "[METAL] Command buffer execution failed";
+  // Defensive null-checks: in practice both nodes are populated when the
+  // status is Error, but the Metal API does not statically guarantee it.
+  if (auto* err = cbuf->error()) {
+    if (auto* desc = err->localizedDescription()) {
+      if (auto* utf = desc->utf8String()) {
+        msg << ": " << utf;
+      }
+    }
+  }
+  scheduler::notify_stream_error(
+      s, std::make_exception_ptr(std::runtime_error(msg.str())));
 }
 
 void eval(array& arr) {
   auto pool = metal::new_scoped_memory_pool();
   auto s = arr.primitive().stream();
+  // Surface any error stashed asynchronously by a prior completion handler
+  // before queueing new work on this stream.
+  scheduler::throw_if_stream_error(s);
   auto& encoder = metal::get_command_encoder(s);
   auto* command_buffer = encoder.get_command_buffer();
 
@@ -62,33 +90,47 @@ void eval(array& arr) {
     scheduler::notify_new_task(s);
     command_buffer->addCompletedHandler(
         [s, buffers = std::move(buffers)](MTL::CommandBuffer* cbuf) {
+          // Stash any error FIRST so a thread woken by
+          // notify_task_completion is guaranteed to observe it on the
+          // next throw_if_stream_error waitpoint. Reversing this order
+          // creates a race where the woken caller can queue more work
+          // before the error is published.
+          check_error(s, cbuf);
           scheduler::notify_task_completion(s);
-          check_error(cbuf);
         });
     encoder.commit();
   } else {
     command_buffer->addCompletedHandler(
-        [buffers = std::move(buffers)](MTL::CommandBuffer* cbuf) {
-          check_error(cbuf);
+        [s, buffers = std::move(buffers)](MTL::CommandBuffer* cbuf) {
+          check_error(s, cbuf);
         });
   }
 }
 
 void finalize(Stream s) {
   auto pool = metal::new_scoped_memory_pool();
+  scheduler::throw_if_stream_error(s);
   auto& encoder = metal::get_command_encoder(s);
   auto* cb = encoder.get_command_buffer();
   encoder.end_encoding();
-  cb->addCompletedHandler([](MTL::CommandBuffer* cbuf) { check_error(cbuf); });
+  cb->addCompletedHandler(
+      [s](MTL::CommandBuffer* cbuf) { check_error(s, cbuf); });
   encoder.commit();
 }
 
 void synchronize(Stream s) {
+  // Surface any error stashed asynchronously by a prior completion handler
+  // before driving the synchronous wait. CommandEncoder::synchronize()
+  // already throws on its own command buffer's error status; this covers
+  // the case where the failing buffer was committed earlier.
+  scheduler::throw_if_stream_error(s);
   metal::get_command_encoder(s).synchronize();
 }
 
 void clear_streams() {
   metal::get_command_encoders().clear();
+  // Encoders are gone; drop any errors stashed against now-dead streams.
+  scheduler::clear_all_stream_errors();
 }
 
 } // namespace mlx::core::gpu
