@@ -114,10 +114,10 @@ class MLX_API Scheduler {
     if (!eptr) return;
     std::lock_guard<std::mutex> lk(error_mtx_);
     auto& slot = stream_errors_[stream.index];
-    if (slot) {
+    if (slot.eptr) {
       return; // first error wins; drop subsequent
     }
-    slot = std::move(eptr);
+    slot = {stream.generation, std::move(eptr)};
     any_stream_error_.store(true, std::memory_order_release);
   }
 
@@ -140,7 +140,12 @@ class MLX_API Scheduler {
       std::lock_guard<std::mutex> lk(error_mtx_);
       auto it = stream_errors_.find(stream.index);
       if (it != stream_errors_.end()) {
-        eptr = std::move(it->second);
+        if (it->second.generation == stream.generation) {
+          eptr = std::move(it->second.eptr);
+        }
+        // Erase unconditionally: a stale entry (generation mismatch) from
+        // a previous stream incarnation is silently discarded rather than
+        // surfaced on the new stream.
         stream_errors_.erase(it);
       }
       // Sentinel transition INSIDE the lock so a concurrent
@@ -156,18 +161,12 @@ class MLX_API Scheduler {
   }
 
   // Drop any stashed error for `stream` without rethrowing. Called from
-  // stream lifecycle hooks (creation / teardown / clear) to prevent a
-  // stale exception from a previous stream incarnation surfacing on a new
-  // stream that happens to reuse the same index.
-  //
-  // Known limitation: a Metal completion handler captured a Stream by
-  // value before the stream was torn down will still call
-  // notify_stream_error with the old index after this clear. If the
-  // index was recycled to a new stream the new stream sees the error
-  // on its next sync waitpoint. Closing that window requires embedding
-  // a generation token in Stream, which is an upstream API change. In
-  // practice user code synchronizes before destroying a stream, which
-  // closes the window without an API change.
+  // stream lifecycle hooks (gpu::new_stream / clear_streams) to sweep out
+  // any leftover entry before the slot is recycled. The erase is by index
+  // only — not by generation — so it clears regardless of incarnation.
+  // Any late-arriving completion handler from the old incarnation that calls
+  // notify_stream_error after this point will store with the old generation;
+  // throw_if_stream_error on the new stream will then discard it on mismatch.
   void clear_stream_error(const Stream& stream) {
     {
       std::lock_guard<std::mutex> lk(error_mtx_);
@@ -282,7 +281,16 @@ class MLX_API Scheduler {
   std::shared_mutex threads_mtx_;
   std::condition_variable completion_cv;
   std::mutex mtx;
-  std::unordered_map<int, std::exception_ptr> stream_errors_;
+  // Value type for stream_errors_. Stores the generation of the stream that
+  // stashed the error alongside the exception_ptr so throw_if_stream_error
+  // can discard entries from a previous stream incarnation that reused the
+  // same index.
+  struct StreamErrorEntry {
+    uint64_t generation{0};
+    std::exception_ptr eptr;
+    explicit operator bool() const noexcept { return eptr != nullptr; }
+  };
+  std::unordered_map<int, StreamErrorEntry> stream_errors_;
   std::mutex error_mtx_;
   // Hot-path sentinel: true iff at least one stream has a stashed error.
   // Lets `throw_if_stream_error` short-circuit on the common no-error path
