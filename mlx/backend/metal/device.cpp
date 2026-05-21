@@ -524,6 +524,27 @@ Device::Device() : device_(load_device()), residency_set_(device_.get()) {
 
 Device::~Device() = default;
 
+ResidencySet& Device::residency_set(int stream_index) {
+  std::lock_guard<std::mutex> lk(residency_sets_per_stream_mtx_);
+  auto it = residency_sets_per_stream_.find(stream_index);
+  if (it == residency_sets_per_stream_.end()) {
+    auto inserted = residency_sets_per_stream_.emplace(
+        stream_index, std::make_unique<ResidencySet>(device_.get()));
+    it = inserted.first;
+  }
+  return *it->second;
+}
+
+void Device::release_stream_residency_set(int stream_index) {
+  std::lock_guard<std::mutex> lk(residency_sets_per_stream_mtx_);
+  residency_sets_per_stream_.erase(stream_index);
+}
+
+void Device::clear_stream_residency_sets() {
+  std::lock_guard<std::mutex> lk(residency_sets_per_stream_mtx_);
+  residency_sets_per_stream_.clear();
+}
+
 MTL::Library* Device::get_library(
     const std::string& name,
     const std::string& path /* = "" */) {
