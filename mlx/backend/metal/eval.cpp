@@ -1,4 +1,6 @@
 // Copyright © 2023-2024 Apple Inc.
+#include <cstdlib>
+#include <limits>
 #include <memory>
 
 #include "mlx/backend/gpu/eval.h"
@@ -8,6 +10,35 @@
 #include "mlx/scheduler.h"
 
 namespace mlx::core::gpu {
+
+namespace {
+
+// Read `MLX_METAL_MAX_INFLIGHT_PER_STREAM`. Unset, empty, or non-positive
+// values mean "no limit": back-pressure is disabled and the gate routes
+// through a single mutex acquisition with no condition-variable wait, so
+// the unthrottled hot path stays cheap.
+int read_inflight_limit() {
+  const char* env = std::getenv("MLX_METAL_MAX_INFLIGHT_PER_STREAM");
+  if (!env || !*env) {
+    return std::numeric_limits<int>::max();
+  }
+  int v = std::atoi(env);
+  return v > 0 ? v : std::numeric_limits<int>::max();
+}
+
+// Read `MLX_METAL_BACKPRESSURE_TIMEOUT_SECS`. Default 30 s. Non-positive
+// or unparseable values fall back to the default so a typo never wedges
+// the process indefinitely.
+int read_backpressure_timeout() {
+  const char* env = std::getenv("MLX_METAL_BACKPRESSURE_TIMEOUT_SECS");
+  if (!env || !*env) {
+    return 30;
+  }
+  int v = std::atoi(env);
+  return v > 0 ? v : 30;
+}
+
+} // namespace
 
 void init() {}
 
@@ -90,14 +121,21 @@ void eval(array& arr) {
     scheduler::notify_new_task(s);
     command_buffer->addCompletedHandler(
         [s, buffers = std::move(buffers)](MTL::CommandBuffer* cbuf) {
-          // Stash any error FIRST so a thread woken by
-          // notify_task_completion is guaranteed to observe it on the
-          // next throw_if_stream_error waitpoint. Reversing this order
-          // creates a race where the woken caller can queue more work
-          // before the error is published.
+          // Release the back-pressure slot first so a waiter blocked in
+          // acquire_stream_slot can advance before the v3 error-publish
+          // / task-completion chain runs. Then preserve v3 ordering:
+          // stash error before signaling task completion so a thread
+          // woken by notify_task_completion is guaranteed to see the
+          // error on its next throw_if_stream_error waitpoint.
+          scheduler::release_stream_slot(s);
           check_error(s, cbuf);
           scheduler::notify_task_completion(s);
         });
+    // Block (if MLX_METAL_MAX_INFLIGHT_PER_STREAM caps in-flight
+    // buffers) until a slot is free. With no env var set the call is a
+    // single mutex acquire.
+    scheduler::acquire_stream_slot(
+        s, read_inflight_limit(), read_backpressure_timeout());
     encoder.commit();
   } else {
     command_buffer->addCompletedHandler(
@@ -113,8 +151,12 @@ void finalize(Stream s) {
   auto& encoder = metal::get_command_encoder(s);
   auto* cb = encoder.get_command_buffer();
   encoder.end_encoding();
-  cb->addCompletedHandler(
-      [s](MTL::CommandBuffer* cbuf) { check_error(s, cbuf); });
+  cb->addCompletedHandler([s](MTL::CommandBuffer* cbuf) {
+    scheduler::release_stream_slot(s);
+    check_error(s, cbuf);
+  });
+  scheduler::acquire_stream_slot(
+      s, read_inflight_limit(), read_backpressure_timeout());
   encoder.commit();
 }
 

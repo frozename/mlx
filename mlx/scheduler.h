@@ -3,9 +3,12 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <future>
+#include <limits>
 #include <queue>
 #include <shared_mutex>
+#include <sstream>
 #include <thread>
 #include <unordered_map>
 
@@ -166,20 +169,99 @@ class MLX_API Scheduler {
   // practice user code synchronizes before destroying a stream, which
   // closes the window without an API change.
   void clear_stream_error(const Stream& stream) {
-    std::lock_guard<std::mutex> lk(error_mtx_);
-    stream_errors_.erase(stream.index);
-    if (stream_errors_.empty()) {
-      any_stream_error_.store(false, std::memory_order_release);
+    {
+      std::lock_guard<std::mutex> lk(error_mtx_);
+      stream_errors_.erase(stream.index);
+      if (stream_errors_.empty()) {
+        any_stream_error_.store(false, std::memory_order_release);
+      }
     }
+    // Drop the in-flight count for this stream as part of the same
+    // lifecycle: when the backend resets a stream we also forget any
+    // commits that were in flight against the previous incarnation.
+    {
+      std::lock_guard<std::mutex> lk(inflight_mtx_);
+      stream_inflight_.erase(stream.index);
+    }
+    inflight_cv_.notify_all();
   }
 
   // Drop all stashed errors across all streams. Called from
   // `clear_streams()` during backend reset / shutdown. Both transitions
   // are sequenced under the mutex.
   void clear_all_stream_errors() {
-    std::lock_guard<std::mutex> lk(error_mtx_);
-    stream_errors_.clear();
-    any_stream_error_.store(false, std::memory_order_release);
+    {
+      std::lock_guard<std::mutex> lk(error_mtx_);
+      stream_errors_.clear();
+      any_stream_error_.store(false, std::memory_order_release);
+    }
+    // Back-pressure state shares the stream lifecycle but lives under a
+    // separate mutex (see `inflight_mtx_` rationale below).
+    {
+      std::lock_guard<std::mutex> lk(inflight_mtx_);
+      stream_inflight_.clear();
+    }
+    inflight_cv_.notify_all();
+  }
+
+  // Acquire a slot on stream `s` before committing a Metal command buffer.
+  // Blocks while `stream_inflight_[s.index] >= limit`. When
+  // `limit == std::numeric_limits<int>::max()` (the default / unset env
+  // var case) the wait is skipped: one mutex acquisition, no condition
+  // variable wait. On timeout the call publishes a backpressure error
+  // through `notify_stream_error` so the caller's next
+  // `throw_if_stream_error` waitpoint rethrows it. The in-flight counter
+  // is NOT incremented on timeout.
+  //
+  // `inflight_mtx_` is intentionally a different mutex from `error_mtx_`:
+  // the timeout branch calls `notify_stream_error` which takes
+  // `error_mtx_`. Holding two of our mutexes simultaneously is forbidden
+  // — drop `inflight_mtx_` before calling `notify_stream_error` so the
+  // never-nest invariant rules out deadlock.
+  void acquire_stream_slot(
+      const Stream& s,
+      int limit,
+      int timeout_secs = 30) {
+    if (limit == std::numeric_limits<int>::max()) {
+      std::lock_guard<std::mutex> lk(inflight_mtx_);
+      ++stream_inflight_[s.index];
+      return;
+    }
+    bool timed_out = false;
+    {
+      std::unique_lock<std::mutex> lk(inflight_mtx_);
+      timed_out = !inflight_cv_.wait_for(
+          lk,
+          std::chrono::seconds(timeout_secs),
+          [this, &s, limit] {
+            return stream_inflight_[s.index] < limit;
+          });
+      if (!timed_out) {
+        ++stream_inflight_[s.index];
+      }
+    }
+    if (timed_out) {
+      std::ostringstream msg;
+      msg << "[MLX] backpressure timeout on stream " << s.index
+          << " after " << timeout_secs << " s";
+      notify_stream_error(
+          s, std::make_exception_ptr(std::runtime_error(msg.str())));
+    }
+  }
+
+  // Release a slot previously acquired by `acquire_stream_slot`. Safe to
+  // call from a Metal completion handler — does not throw, does not
+  // allocate, and the notify_all is outside the critical section so
+  // waiters wake without re-acquiring against this thread.
+  void release_stream_slot(const Stream& s) {
+    {
+      std::lock_guard<std::mutex> lk(inflight_mtx_);
+      auto it = stream_inflight_.find(s.index);
+      if (it != stream_inflight_.end() && it->second > 0) {
+        --it->second;
+      }
+    }
+    inflight_cv_.notify_all();
   }
 
   void wait_for_one() {
@@ -206,6 +288,15 @@ class MLX_API Scheduler {
   // Lets `throw_if_stream_error` short-circuit on the common no-error path
   // without touching the mutex.
   std::atomic<bool> any_stream_error_{false};
+
+  // Per-stream in-flight Metal command-buffer counts; guarded by
+  // `inflight_mtx_`. Waiters block on `inflight_cv_` until the count
+  // drops below the configured `MLX_METAL_MAX_INFLIGHT_PER_STREAM`
+  // limit, with a finite fallback timeout that routes through the
+  // existing stream-error stash.
+  std::unordered_map<int, int> stream_inflight_;
+  std::mutex inflight_mtx_;
+  std::condition_variable inflight_cv_;
 };
 
 MLX_API Scheduler& scheduler();
@@ -243,6 +334,17 @@ inline void clear_stream_error(const Stream& stream) {
 
 inline void clear_all_stream_errors() {
   scheduler().clear_all_stream_errors();
+}
+
+inline void acquire_stream_slot(
+    const Stream& stream,
+    int limit,
+    int timeout_secs = 30) {
+  scheduler().acquire_stream_slot(stream, limit, timeout_secs);
+}
+
+inline void release_stream_slot(const Stream& stream) {
+  scheduler().release_stream_slot(stream);
 }
 
 inline void wait_for_one() {
