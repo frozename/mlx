@@ -4,6 +4,7 @@
 
 #include <Metal/Metal.hpp>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
@@ -180,6 +181,24 @@ class MLX_API Device {
     return residency_set_;
   }
 
+  // Per-stream residency set. Lazily created on first call; safe to call
+  // from any thread. Backends that want to wire stream-specific
+  // allocations (e.g. KV-cache pages assigned to a particular model on
+  // a particular stream) can register them here without affecting the
+  // device-global wired pool returned by `residency_set()`.
+  //
+  // The mapping is keyed by `stream.index`. The existing per-stream
+  // command queues (one MTL::CommandQueue per CommandEncoder) already
+  // give each stream its own GPU-scheduler queue; this accessor closes
+  // the matching gap for per-stream wired-memory association.
+  //
+  // Lifecycle: callers should invoke `release_stream_residency_set(s)`
+  // when the owning stream is torn down. `clear_streams()` releases all
+  // per-stream sets in one call.
+  ResidencySet& residency_set(int stream_index);
+  void release_stream_residency_set(int stream_index);
+  void clear_stream_residency_sets();
+
  private:
   NS::SharedPtr<MTL::Library> build_library_(const std::string& source_string);
 
@@ -212,6 +231,9 @@ class MLX_API Device {
 
   NS::SharedPtr<MTL::Device> device_;
   ResidencySet residency_set_;
+  std::unordered_map<int, std::unique_ptr<ResidencySet>>
+      residency_sets_per_stream_;
+  std::mutex residency_sets_per_stream_mtx_;
 
   std::shared_mutex kernel_mtx_;
   std::shared_mutex library_mtx_;

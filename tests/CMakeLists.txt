@@ -34,6 +34,7 @@ target_sources(
           test_metal_backpressure.cpp
           test_stream_generation.cpp
           test_stream_tag.cpp
+          test_metal_per_stream_residency.cpp
           utils_tests.cpp
           vmap_tests.cpp
           linalg_tests.cpp
