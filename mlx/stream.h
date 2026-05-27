@@ -4,6 +4,8 @@
 
 #include <atomic>
 #include <cstdint>
+#include <optional>
+#include <string>
 #include <vector>
 
 #include "mlx/api.h"
@@ -19,10 +21,21 @@ struct MLX_API Stream {
   // stream reuses the same index, the stale generation lets the scheduler
   // distinguish the old handler's error from a real error on the new stream.
   uint64_t generation{0};
+  // Optional advisory tag used by higher layers (oMLX, mlx-lm) to record
+  // model affinity. The backend MAY use this to key per-stream resources
+  // such as command queues (#3491) or residency sets (#3492); when unset
+  // (the default) the backend falls back to its global resources, so
+  // existing call sites compile and behave unchanged. Not consulted by
+  // equality / ordering: two streams with the same {index, device} are
+  // considered identical regardless of tag.
+  std::optional<std::string> tag = std::nullopt;
   explicit Stream(int index, Device device) : index(index), device(device) {}
+  Stream(int index, Device device, std::string tag)
+      : index(index), device(device), tag(std::move(tag)) {}
 
-  // TODO: Use default three-way comparison when it gets supported in XCode.
-  bool operator==(const Stream&) const = default;
+  bool operator==(const Stream& rhs) const {
+    return index == rhs.index && device == rhs.device;
+  }
   bool operator<(const Stream& rhs) const {
     return device < rhs.device || index < rhs.index;
   }

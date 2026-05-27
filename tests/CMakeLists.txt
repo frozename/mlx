@@ -33,6 +33,7 @@ target_sources(
           scheduler_tests.cpp
           test_metal_backpressure.cpp
           test_stream_generation.cpp
+          test_stream_tag.cpp
           utils_tests.cpp
           vmap_tests.cpp
           linalg_tests.cpp
@@ -52,3 +53,9 @@ target_link_libraries(test_teardown PRIVATE mlx)
 target_compile_options(test_teardown PRIVATE ${SANITIZER_COMPILE_FLAGS})
 target_link_options(test_teardown PRIVATE ${SANITIZER_LINK_FLAGS})
 add_test(NAME teardown COMMAND test_teardown)
+
+add_executable(test_stream_tag tests.cpp test_stream_tag.cpp)
+target_link_libraries(test_stream_tag PRIVATE mlx doctest)
+target_compile_options(test_stream_tag PRIVATE ${SANITIZER_COMPILE_FLAGS})
+target_link_options(test_stream_tag PRIVATE ${SANITIZER_LINK_FLAGS})
+add_test(NAME stream_tag COMMAND test_stream_tag)
