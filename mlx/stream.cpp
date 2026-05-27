@@ -13,6 +13,12 @@
 
 namespace mlx::core {
 
+// Definition of the process-global stream generation counter declared in
+// mlx/stream.h. Starts at 0; new_stream() pre-increments before stamping
+// so every live stream carries generation ≥ 1, leaving 0 as the sentinel
+// for default-constructed or uninitialized Stream objects.
+std::atomic<uint64_t> stream_generation_counter_{0};
+
 namespace {
 
 auto& default_stream_storage(Device d) {
@@ -69,6 +75,8 @@ Stream new_stream(Device d) {
   std::unique_lock lock(mtx);
   int index = streams.size();
   auto& s = streams.emplace_back(index, d);
+  s.generation =
+      stream_generation_counter_.fetch_add(1, std::memory_order_relaxed) + 1;
   if (d == Device::gpu) {
     gpu::new_stream(s);
   } else {
