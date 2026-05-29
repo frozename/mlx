@@ -147,6 +147,17 @@ class MLX_API Scheduler {
   // sentinel is mutated only while holding `error_mtx_`, so the cleared
   // observation that a no-pending reader gets via this fast path is
   // tied to a real lock-protected emptiness check by some other thread.
+  //
+  // Contention note: `any_stream_error_` is process-global, not per-stream.
+  // While ANY stream has an unconsumed error, error-free streams fall off
+  // the fast path and briefly take `error_mtx_` (find-miss, no-op). This is
+  // intentional: the window is bounded by the erroring stream's next
+  // waitpoint, which drains its entry and lowers the sentinel — promptly,
+  // since errors surface at the next eval/finalize/sync on that stream
+  // (recovery paths still consume the rethrow). A per-stream lock-free flag
+  // was rejected: stream indices are unbounded, so a bitset/array does not
+  // scale and any map-backed check needs the lock anyway. The conservative
+  // global gate keeps the design simple and correct.
   void throw_if_stream_error(const Stream& stream) {
     if (!any_stream_error_.load(std::memory_order_acquire)) {
       return;

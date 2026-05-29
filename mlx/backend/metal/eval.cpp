@@ -193,6 +193,11 @@ void clear_streams() {
   metal::get_command_encoders().clear();
   // Encoders are gone; drop any errors stashed against now-dead streams.
   scheduler::clear_all_stream_errors();
+  // Release the per-stream residency sets as well. device.h documents
+  // clear_streams() as the single call that frees them, but the encoders map
+  // cleared above does not own them — without this they leak across backend
+  // resets and shutdown.
+  metal::device(Device::gpu).clear_stream_residency_sets();
 }
 
 } // namespace mlx::core::gpu

@@ -6,14 +6,13 @@
 // stream-specific allocations into the GPU's wired pool without affecting
 // the device-global `residency_set()`.
 //
-// Skipped when MLX_BUILD_METAL is off (no Device available).
+// Compiled only when MLX_BUILD_METAL is on — gated in tests/CMakeLists.txt,
+// not via an in-source `#ifdef _METAL_` (that macro is defined for downstream
+// consumers via MLXConfig.cmake, not for the in-tree tests target).
 
 #include "doctest/doctest.h"
 
 #include "mlx/mlx.h"
-
-#ifdef _METAL_
-
 #include "mlx/backend/metal/device.h"
 
 using namespace mlx::core;
@@ -39,23 +38,18 @@ TEST_CASE("per-stream residency set: distinct from device-global set") {
   CHECK(&per_stream != &global);
 }
 
-TEST_CASE("per-stream residency set: release deallocates") {
+TEST_CASE("per-stream residency set: re-allocation after release is functional") {
   auto& d = metal::device(Device::gpu);
-  auto& a = d.residency_set(9005);
-  // Take the underlying mtl pointer before release so we can compare.
-  const void* before_ptr = static_cast<const void*>(&a);
+  (void)d.residency_set(9005);
   d.release_stream_residency_set(9005);
-  // After release the next call should produce a freshly-allocated set,
-  // which may or may not land at the same address depending on allocator
-  // reuse. We can't directly verify the deallocation; what we CAN verify
-  // is that the new set is consistent (re-allocation succeeds) and that
-  // the index has been freed for re-use.
+  // After release the index re-allocates a fresh set. We can't assert
+  // deallocation directly (allocator reuse may land the new set at the same
+  // address), but we CAN assert the accessor stays functional: the
+  // re-allocated set is stable across calls and remains distinct from the
+  // device-global set.
   auto& b = d.residency_set(9005);
-  // Either a freshly-allocated set or accidental reuse — either way the
-  // accessor must not crash and the returned set must be functional.
-  (void)before_ptr;
-  (void)b;
-  CHECK(true);
+  CHECK(&b == &d.residency_set(9005)); // stable / idempotent after realloc
+  CHECK(&b != &d.residency_set());     // still distinct from device-global
 }
 
 TEST_CASE("per-stream residency set: clear_stream_residency_sets releases all") {
@@ -63,12 +57,11 @@ TEST_CASE("per-stream residency set: clear_stream_residency_sets releases all") 
   (void)d.residency_set(9006);
   (void)d.residency_set(9007);
   d.clear_stream_residency_sets();
-  // After clear, both indices should re-allocate freshly. Nothing to
-  // assert deterministically about pointer identity; the assertion is
-  // that the call completes without throwing.
-  (void)d.residency_set(9006);
-  (void)d.residency_set(9007);
-  CHECK(true);
+  // After clear, both indices re-allocate fresh, functional sets: distinct
+  // per index, distinct from the device-global set, and stable across calls.
+  auto& r6 = d.residency_set(9006);
+  auto& r7 = d.residency_set(9007);
+  CHECK(&r6 != &r7);                    // distinct indices -> distinct sets
+  CHECK(&r6 != &d.residency_set());     // distinct from device-global
+  CHECK(&r6 == &d.residency_set(9006)); // stable after re-allocation
 }
-
-#endif // _METAL_

@@ -9,6 +9,13 @@ add_executable(tests ${PROJECT_SOURCE_DIR}/tests/tests.cpp)
 if(MLX_BUILD_METAL OR MLX_BUILD_CUDA)
   set(METAL_TEST_SOURCES gpu_tests.cpp)
 endif()
+# Metal-only: exercises MTL::ResidencySet directly. Gated here rather than via
+# an in-source `#ifdef _METAL_` because that macro is defined only for
+# downstream consumers (MLXConfig.cmake's MLX_CXX_FLAGS), not for the in-tree
+# `tests` target — an in-source guard silently compiled the whole file out.
+if(MLX_BUILD_METAL)
+  list(APPEND METAL_TEST_SOURCES test_metal_per_stream_residency.cpp)
+endif()
 
 include(${doctest_SOURCE_DIR}/scripts/cmake/doctest.cmake)
 
@@ -34,7 +41,6 @@ target_sources(
           test_metal_backpressure.cpp
           test_stream_generation.cpp
           test_stream_tag.cpp
-          test_metal_per_stream_residency.cpp
           utils_tests.cpp
           vmap_tests.cpp
           linalg_tests.cpp
@@ -54,9 +60,3 @@ target_link_libraries(test_teardown PRIVATE mlx)
 target_compile_options(test_teardown PRIVATE ${SANITIZER_COMPILE_FLAGS})
 target_link_options(test_teardown PRIVATE ${SANITIZER_LINK_FLAGS})
 add_test(NAME teardown COMMAND test_teardown)
-
-add_executable(test_stream_tag tests.cpp test_stream_tag.cpp)
-target_link_libraries(test_stream_tag PRIVATE mlx doctest)
-target_compile_options(test_stream_tag PRIVATE ${SANITIZER_COMPILE_FLAGS})
-target_link_options(test_stream_tag PRIVATE ${SANITIZER_LINK_FLAGS})
-add_test(NAME stream_tag COMMAND test_stream_tag)
