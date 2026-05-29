@@ -21,17 +21,7 @@ struct MLX_API Stream {
   // stream reuses the same index, the stale generation lets the scheduler
   // distinguish the old handler's error from a real error on the new stream.
   uint64_t generation{0};
-  // Optional advisory tag used by higher layers (oMLX, mlx-lm) to record
-  // model affinity. The backend MAY use this to key per-stream resources
-  // such as command queues (#3491) or residency sets (#3492); when unset
-  // (the default) the backend falls back to its global resources, so
-  // existing call sites compile and behave unchanged. Not consulted by
-  // equality / ordering: two streams with the same {index, device} are
-  // considered identical regardless of tag.
-  std::optional<std::string> tag = std::nullopt;
   explicit Stream(int index, Device device) : index(index), device(device) {}
-  Stream(int index, Device device, std::string tag)
-      : index(index), device(device), tag(std::move(tag)) {}
 
   bool operator==(const Stream& rhs) const {
     return index == rhs.index && device == rhs.device;
@@ -81,5 +71,17 @@ MLX_API void synchronize(ThreadLocalStream);
 
 /* Destroy all streams created in current thread. */
 MLX_API void clear_streams();
+
+/* Advisory per-stream tag (e.g. model affinity) used by higher layers
+ * (oMLX, mlx-lm) to key downstream resources. Stored in a side-registry keyed
+ * by stream.index rather than on the Stream struct itself, so the handle stays
+ * small and trivially-copyable — Stream is captured BY VALUE in Metal
+ * completion-handler lambdas on the hot submission path, where an embedded
+ * std::optional<std::string> would inflate the capture and heap-allocate on
+ * copy for non-SSO tags. Not part of stream identity: equality / ordering
+ * ignore the tag (two streams with the same {index, device} are identical). */
+MLX_API void set_stream_tag(const Stream& s, std::string tag);
+MLX_API std::optional<std::string> stream_tag(const Stream& s);
+MLX_API void clear_stream_tag(const Stream& s);
 
 } // namespace mlx::core

@@ -10,6 +10,8 @@
 #include <map>
 #include <optional>
 #include <shared_mutex>
+#include <string>
+#include <unordered_map>
 
 namespace mlx::core {
 
@@ -40,6 +42,15 @@ auto& all_streams() {
 auto& thread_local_streams() {
   static std::tuple<std::vector<ThreadLocalStream>, std::mutex> streams_and_mtx;
   return streams_and_mtx;
+}
+
+// Side-registry for advisory per-stream tags, keyed by stream.index. Kept off
+// the Stream struct so the handle stays small and trivially-copyable on the
+// hot Metal completion-handler path (see set_stream_tag in mlx/stream.h).
+auto& stream_tags() {
+  static std::tuple<std::unordered_map<int, std::string>, std::shared_mutex>
+      tags_and_mtx;
+  return tags_and_mtx;
 }
 
 } // namespace
@@ -99,6 +110,28 @@ Stream stream_from_thread_local_stream(ThreadLocalStream tls) {
     it = streams.emplace(tls, new_stream(tls.device)).first;
   }
   return it->second;
+}
+
+void set_stream_tag(const Stream& s, std::string tag) {
+  auto& [tags, mtx] = stream_tags();
+  std::unique_lock lock(mtx);
+  tags[s.index] = std::move(tag);
+}
+
+std::optional<std::string> stream_tag(const Stream& s) {
+  auto& [tags, mtx] = stream_tags();
+  std::shared_lock lock(mtx);
+  auto it = tags.find(s.index);
+  if (it == tags.end()) {
+    return std::nullopt;
+  }
+  return it->second;
+}
+
+void clear_stream_tag(const Stream& s) {
+  auto& [tags, mtx] = stream_tags();
+  std::unique_lock lock(mtx);
+  tags.erase(s.index);
 }
 
 } // namespace mlx::core
