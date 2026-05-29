@@ -17,25 +17,39 @@ namespace {
 // values mean "no limit": back-pressure is disabled and the gate routes
 // through a single mutex acquisition with no condition-variable wait, so
 // the unthrottled hot path stays cheap.
+//
+// Cached once at first use via the C++11 function-local-static guarantee
+// (thread-safe, equivalent to std::call_once). This runs on the hot Metal
+// submission path — every eval()/finalize() — and std::getenv takes an
+// internal process-wide libc lock on many platforms and is not
+// async-signal-safe. The env var is a static process-level tuning knob, so
+// a single read is the correct contract.
 int read_inflight_limit() {
-  const char* env = std::getenv("MLX_METAL_MAX_INFLIGHT_PER_STREAM");
-  if (!env || !*env) {
-    return std::numeric_limits<int>::max();
-  }
-  int v = std::atoi(env);
-  return v > 0 ? v : std::numeric_limits<int>::max();
+  static const int limit = [] {
+    const char* env = std::getenv("MLX_METAL_MAX_INFLIGHT_PER_STREAM");
+    if (!env || !*env) {
+      return std::numeric_limits<int>::max();
+    }
+    int v = std::atoi(env);
+    return v > 0 ? v : std::numeric_limits<int>::max();
+  }();
+  return limit;
 }
 
 // Read `MLX_METAL_BACKPRESSURE_TIMEOUT_SECS`. Default 30 s. Non-positive
 // or unparseable values fall back to the default so a typo never wedges
-// the process indefinitely.
+// the process indefinitely. Cached once at first use — same hot-path
+// rationale as read_inflight_limit().
 int read_backpressure_timeout() {
-  const char* env = std::getenv("MLX_METAL_BACKPRESSURE_TIMEOUT_SECS");
-  if (!env || !*env) {
-    return 30;
-  }
-  int v = std::atoi(env);
-  return v > 0 ? v : 30;
+  static const int timeout = [] {
+    const char* env = std::getenv("MLX_METAL_BACKPRESSURE_TIMEOUT_SECS");
+    if (!env || !*env) {
+      return 30;
+    }
+    int v = std::atoi(env);
+    return v > 0 ? v : 30;
+  }();
+  return timeout;
 }
 
 } // namespace
@@ -131,9 +145,15 @@ void eval(array& arr) {
           check_error(s, cbuf);
           scheduler::notify_task_completion(s);
         });
-    // Block (if MLX_METAL_MAX_INFLIGHT_PER_STREAM caps in-flight
-    // buffers) until a slot is free. With no env var set the call is a
-    // single mutex acquire.
+    // Block (if MLX_METAL_MAX_INFLIGHT_PER_STREAM caps in-flight buffers)
+    // until a slot is free. With no env var set the call is a single mutex
+    // acquire. On backpressure timeout it stashes an error AND still
+    // increments the slot, so we commit unconditionally here: the completion
+    // handler above always releases, keeping the counter balanced, and the
+    // stashed error fails the stream at its next throw_if_stream_error
+    // waitpoint. We must not skip the commit — notify_new_task() above is
+    // balanced only by the committed buffer's notify_task_completion(), so a
+    // skipped commit would leak an active task and hang synchronize().
     scheduler::acquire_stream_slot(
         s, read_inflight_limit(), read_backpressure_timeout());
     encoder.commit();

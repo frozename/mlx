@@ -100,3 +100,62 @@ TEST_CASE(
   CHECK(threw3);
   CHECK(msg3.find("error attributed to old") != std::string::npos);
 }
+
+TEST_CASE(
+    "newer-generation error supersedes a stranded stale error in notify" *
+    doctest::test_suite("[stream-generation]")) {
+  // Regression for the notify_stream_error ABA race. Timeline:
+  //   1. A stream (index i, generation N) is torn down; its in-flight Metal
+  //      completion handler is still queued on libdispatch.
+  //   2. A new stream reuses index i as generation N+1.
+  //   3. The OLD handler finally runs and stashes an error against index i.
+  //   4. The new incarnation hits its OWN error and calls notify.
+  // Before the fix, step 4 saw an occupied slot (first-error-wins) and
+  // dropped the live error; throw_if_stream_error then discarded the stale
+  // step-3 entry on generation mismatch, so the real failure vanished and the
+  // stream looked healthy. The fix lets the higher generation supersede.
+  constexpr int kTestIndex = 8'000'017;
+  constexpr uint64_t kOldGen = 41;
+  constexpr uint64_t kNewGen = 42;
+  auto old_s = make_incarnation(kTestIndex, kOldGen);
+  auto new_s = make_incarnation(kTestIndex, kNewGen);
+
+  // Stale error from the old incarnation lands first and occupies the slot.
+  scheduler::notify_stream_error(
+      old_s,
+      std::make_exception_ptr(std::runtime_error("stale old-gen error")));
+
+  // The new incarnation's real error arrives via notify WITHOUT an
+  // intervening throw_if_stream_error — that ordering is what makes this an
+  // ABA rather than the already-covered discard-on-throw path.
+  scheduler::notify_stream_error(
+      new_s,
+      std::make_exception_ptr(std::runtime_error("live new-gen error")));
+
+  // The new incarnation MUST observe its own error, not silence.
+  bool threw = false;
+  std::string msg;
+  try {
+    scheduler::throw_if_stream_error(new_s);
+  } catch (const std::runtime_error& e) {
+    threw = true;
+    msg = e.what();
+  }
+  CHECK(threw);
+  CHECK(msg.find("live new-gen error") != std::string::npos);
+
+  // Inverse direction: a late duplicate from the OLD incarnation arriving
+  // after the supersede must NOT surface on the new incarnation. (The slot
+  // was consumed by the throw above, so this stash occupies it again under
+  // the old generation; a new-gen throw discards it on mismatch.)
+  scheduler::notify_stream_error(
+      old_s,
+      std::make_exception_ptr(std::runtime_error("late old-gen dup")));
+  bool threw2 = false;
+  try {
+    scheduler::throw_if_stream_error(new_s);
+  } catch (...) {
+    threw2 = true;
+  }
+  CHECK_FALSE(threw2);
+}

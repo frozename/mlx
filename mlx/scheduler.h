@@ -102,8 +102,12 @@ class MLX_API Scheduler {
 
   // Stash an exception on a stream from a background thread (e.g. a Metal
   // completion handler running on libdispatch). Cannot throw from those
-  // contexts — see mlx-explore/mlx#2670. If a stream already has a pending
-  // error, the new one is dropped (first error wins).
+  // contexts — see mlx-explore/mlx#2670. Within a single incarnation the
+  // first error wins; later errors for the same generation are dropped.
+  // A higher-generation error, however, SUPERSEDES a stale one: a late
+  // completion handler from a torn-down stream can stash an error against a
+  // reused index, and that stale entry must not block the live error from
+  // the new incarnation (ABA race — see body).
   //
   // The sentinel transition runs INSIDE `error_mtx_` so it cannot race
   // against a concurrent `throw_if_stream_error` lowering the sentinel
@@ -115,7 +119,19 @@ class MLX_API Scheduler {
     std::lock_guard<std::mutex> lk(error_mtx_);
     auto& slot = stream_errors_[stream.index];
     if (slot.eptr) {
-      return; // first error wins; drop subsequent
+      // The slot is occupied. First-error-wins WITHIN an incarnation, but a
+      // newer incarnation's error must supersede a stale one stranded by a
+      // late completion handler from a destroyed stream that reused this
+      // index. Without this, the stale (lower-generation) entry blocks the
+      // live error; throw_if_stream_error then discards the stale entry on
+      // generation mismatch and the real failure is silently lost.
+      if (stream.generation > slot.generation) {
+        slot = {stream.generation, std::move(eptr)};
+        // any_stream_error_ is already true (set when the stale error landed).
+      }
+      // Same-or-lower generation: keep the existing error (true first-error
+      // for the live incarnation; ignore a late duplicate from a dead one).
+      return;
     }
     slot = {stream.generation, std::move(eptr)};
     any_stream_error_.store(true, std::memory_order_release);
@@ -204,13 +220,23 @@ class MLX_API Scheduler {
   }
 
   // Acquire a slot on stream `s` before committing a Metal command buffer.
-  // Blocks while `stream_inflight_[s.index] >= limit`. When
+  // Blocks while the live incarnation's in-flight count is `>= limit`. When
   // `limit == std::numeric_limits<int>::max()` (the default / unset env
   // var case) the wait is skipped: one mutex acquisition, no condition
-  // variable wait. On timeout the call publishes a backpressure error
-  // through `notify_stream_error` so the caller's next
-  // `throw_if_stream_error` waitpoint rethrows it. The in-flight counter
-  // is NOT incremented on timeout.
+  // variable wait.
+  //
+  // The in-flight counter is incremented UNCONDITIONALLY — including on
+  // timeout. The caller (eval()/finalize()) commits the command buffer
+  // regardless of the result, and its completion handler always calls
+  // release_stream_slot; incrementing even on timeout keeps the two balanced
+  // so release can never underflow. A hard commit-gate (skip commit on
+  // timeout) is NOT used here because eval() calls notify_new_task() before
+  // this point and the balancing notify_task_completion() only fires from the
+  // committed buffer's completion handler — skipping the commit would leak an
+  // active task and hang synchronize(). The cap is therefore soft: on timeout
+  // the call still publishes a backpressure error through
+  // `notify_stream_error`, so the caller's next `throw_if_stream_error`
+  // waitpoint rethrows it and fails the stream.
   //
   // `inflight_mtx_` is intentionally a different mutex from `error_mtx_`:
   // the timeout branch calls `notify_stream_error` which takes
@@ -223,7 +249,7 @@ class MLX_API Scheduler {
       int timeout_secs = 30) {
     if (limit == std::numeric_limits<int>::max()) {
       std::lock_guard<std::mutex> lk(inflight_mtx_);
-      ++stream_inflight_[s.index];
+      bump_inflight(s);
       return;
     }
     bool timed_out = false;
@@ -232,12 +258,9 @@ class MLX_API Scheduler {
       timed_out = !inflight_cv_.wait_for(
           lk,
           std::chrono::seconds(timeout_secs),
-          [this, &s, limit] {
-            return stream_inflight_[s.index] < limit;
-          });
-      if (!timed_out) {
-        ++stream_inflight_[s.index];
-      }
+          [this, &s, limit] { return current_inflight(s) < limit; });
+      // Increment regardless of timeout — see the contract above.
+      bump_inflight(s);
     }
     if (timed_out) {
       std::ostringstream msg;
@@ -252,13 +275,22 @@ class MLX_API Scheduler {
   // call from a Metal completion handler — does not throw, does not
   // allocate, and the notify_all is outside the critical section so
   // waiters wake without re-acquiring against this thread.
+  //
+  // Generation-validated: a late completion handler from a torn-down stream
+  // that reused this index carries the OLD generation. Decrementing on that
+  // stale release would corrupt the new incarnation's count and grant it
+  // free slots beyond the cap (ABA race), so we only decrement when the
+  // entry's generation matches the releasing stream's.
   void release_stream_slot(const Stream& s) {
     {
       std::lock_guard<std::mutex> lk(inflight_mtx_);
       auto it = stream_inflight_.find(s.index);
-      if (it != stream_inflight_.end() && it->second > 0) {
-        --it->second;
+      if (it != stream_inflight_.end() &&
+          it->second.generation == s.generation && it->second.count > 0) {
+        --it->second.count;
       }
+      // Otherwise: no entry, a stale-generation entry from a dead incarnation,
+      // or already drained — ignore so a live incarnation never underflows.
     }
     inflight_cv_.notify_all();
   }
@@ -297,14 +329,46 @@ class MLX_API Scheduler {
   // without touching the mutex.
   std::atomic<bool> any_stream_error_{false};
 
+  // Value type for stream_inflight_. The generation is stamped alongside the
+  // count so a late completion handler from a previous incarnation that
+  // reused the same index cannot decrement (or be counted against) the live
+  // incarnation — see release_stream_slot / current_inflight.
+  struct StreamInflightEntry {
+    uint64_t generation{0};
+    int count{0};
+  };
   // Per-stream in-flight Metal command-buffer counts; guarded by
-  // `inflight_mtx_`. Waiters block on `inflight_cv_` until the count
-  // drops below the configured `MLX_METAL_MAX_INFLIGHT_PER_STREAM`
-  // limit, with a finite fallback timeout that routes through the
-  // existing stream-error stash.
-  std::unordered_map<int, int> stream_inflight_;
+  // `inflight_mtx_`. Waiters block on `inflight_cv_` until the live
+  // incarnation's count drops below the configured
+  // `MLX_METAL_MAX_INFLIGHT_PER_STREAM` limit, with a finite fallback timeout
+  // that routes through the existing stream-error stash.
+  std::unordered_map<int, StreamInflightEntry> stream_inflight_;
   std::mutex inflight_mtx_;
   std::condition_variable inflight_cv_;
+
+  // Caller MUST hold `inflight_mtx_`. Return the live incarnation's in-flight
+  // count, first resetting any entry left over from an earlier incarnation
+  // that reused this index. The stale incarnation's outstanding completion
+  // handlers carry the old generation and so cannot decrement this count
+  // (see release_stream_slot); discarding their leftover tally here prevents
+  // a new incarnation from being blocked by a dead one's residual count.
+  int current_inflight(const Stream& s) {
+    auto& e = stream_inflight_[s.index];
+    if (e.generation != s.generation) {
+      e = {s.generation, 0};
+    }
+    return e.count;
+  }
+
+  // Caller MUST hold `inflight_mtx_`. Increment the live incarnation's
+  // in-flight count, resetting a stale-generation entry first.
+  void bump_inflight(const Stream& s) {
+    auto& e = stream_inflight_[s.index];
+    if (e.generation != s.generation) {
+      e = {s.generation, 0};
+    }
+    ++e.count;
+  }
 };
 
 MLX_API Scheduler& scheduler();
