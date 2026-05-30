@@ -3,8 +3,10 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <exception>
 #include <future>
+#include <limits>
 #include <queue>
 #include <shared_mutex>
 #include <thread>
@@ -179,6 +181,62 @@ class MLX_API Scheduler {
     }
   }
 
+  // Best-effort per-stream back-pressure (opt-in via
+  // MLX_METAL_MAX_INFLIGHT_PER_STREAM; OFF by default). Blocks the submitting
+  // thread until this stream has fewer than `limit` command buffers in flight,
+  // then records one more. This throttles submission rate so a fast producer
+  // cannot queue unbounded GPU work and exhaust memory.
+  //
+  // `timeout_secs` is a hard anti-deadlock deadline, not the cap itself: if a
+  // slot does not free within it (e.g. the GPU is wedged) the call proceeds
+  // anyway — the cap degrades to advisory rather than failing a slow-but-
+  // healthy stream. Callers gate on `limit == INT_MAX` to skip this entirely
+  // when disabled, so the default path pays nothing; the guard below keeps a
+  // direct call cheap and side-effect-free too.
+  void acquire_stream_slot(
+      const Stream& s,
+      int limit,
+      int timeout_secs = 30) {
+    if (limit == std::numeric_limits<int>::max()) {
+      return;
+    }
+    std::unique_lock<std::mutex> lk(inflight_mtx_);
+    inflight_cv_.wait_for(
+        lk,
+        std::chrono::seconds(timeout_secs),
+        [this, &s, limit] { return inflight_count(s) < limit; });
+    ++stream_inflight_[s.index];
+  }
+
+  // Release a slot taken by acquire_stream_slot. Safe to call from a Metal
+  // completion handler: does not throw or allocate, and notify happens outside
+  // the critical section. Only signals waiters when it actually freed a slot.
+  //
+  // A drained entry is left at count 0 rather than erased: the map is bounded
+  // by the number of distinct streams (indices are append-only and few), so a
+  // stale 0 costs a handful of bytes, whereas erase+reinsert would churn a heap
+  // allocation under the lock on every submit/complete cycle of the hot path.
+  //
+  // Both waiters share one condition variable, so notify_all wakes submitters
+  // blocked on *other* streams too; they re-check their predicate and sleep
+  // again. Acceptable for this opt-in throttle at the small stream counts it
+  // targets — revisit with per-stream CVs only if multi-stream contention is
+  // ever measured.
+  void release_stream_slot(const Stream& s) {
+    bool freed = false;
+    {
+      std::lock_guard<std::mutex> lk(inflight_mtx_);
+      auto it = stream_inflight_.find(s.index);
+      if (it != stream_inflight_.end() && it->second > 0) {
+        --it->second;
+        freed = true;
+      }
+    }
+    if (freed) {
+      inflight_cv_.notify_all();
+    }
+  }
+
   void wait_for_one() {
     std::unique_lock<std::mutex> lk(mtx);
     int n_tasks_old = n_active_tasks();
@@ -207,6 +265,21 @@ class MLX_API Scheduler {
   // `throw_if_stream_error` short-circuit on the common no-error path without
   // touching the mutex. Mutated only under `stream_error_mtx_`.
   std::atomic<bool> has_pending_stream_error_{false};
+
+  // Per-stream in-flight command-buffer counts for opt-in back-pressure
+  // (acquire/release_stream_slot). Keyed by stream index; guarded by
+  // `inflight_mtx_`. Drained entries stay at count 0 (bounded by the number of
+  // distinct streams). Touched only when MLX_METAL_MAX_INFLIGHT_PER_STREAM is
+  // set.
+  std::unordered_map<int, int> stream_inflight_;
+  std::mutex inflight_mtx_;
+  std::condition_variable inflight_cv_;
+
+  // Caller MUST hold `inflight_mtx_`. Live in-flight count for `s` (0 if none).
+  int inflight_count(const Stream& s) {
+    auto it = stream_inflight_.find(s.index);
+    return it == stream_inflight_.end() ? 0 : it->second;
+  }
 };
 
 MLX_API Scheduler& scheduler();
@@ -240,6 +313,17 @@ inline void throw_if_stream_error(const Stream& stream) {
 
 inline void clear_stream_error(const Stream& stream) {
   scheduler().clear_stream_error(stream);
+}
+
+inline void acquire_stream_slot(
+    const Stream& stream,
+    int limit,
+    int timeout_secs = 30) {
+  scheduler().acquire_stream_slot(stream, limit, timeout_secs);
+}
+
+inline void release_stream_slot(const Stream& stream) {
+  scheduler().release_stream_slot(stream);
 }
 
 inline void wait_for_one() {

@@ -1,4 +1,7 @@
 // Copyright © 2023-2024 Apple Inc.
+#include <cerrno>
+#include <cstdlib>
+#include <limits>
 #include <memory>
 
 #include "mlx/backend/gpu/eval.h"
@@ -8,6 +11,50 @@
 #include "mlx/scheduler.h"
 
 namespace mlx::core::gpu {
+
+namespace {
+
+// Parse a positive-int environment variable. Returns `fallback` when the var is
+// unset, empty, malformed, out of int range, or non-positive. Uses strtol (not
+// atoi, which silently yields 0 on garbage and is undefined on overflow) so a
+// typo can never wedge or mis-tune the gate.
+int read_positive_env_int(const char* name, int fallback) {
+  const char* env = std::getenv(name);
+  if (!env || !*env) {
+    return fallback;
+  }
+  errno = 0;
+  char* end = nullptr;
+  long v = std::strtol(env, &end, 10);
+  if (errno != 0 || end == env || *end != '\0' || v <= 0 ||
+      v > std::numeric_limits<int>::max()) {
+    return fallback;
+  }
+  return static_cast<int>(v);
+}
+
+// MLX_METAL_MAX_INFLIGHT_PER_STREAM: max command buffers in flight per stream
+// before submission blocks. Unset/invalid -> INT_MAX, i.e. back-pressure is OFF
+// and acquire/release are skipped entirely so the default hot path pays
+// nothing. Cached once at first use via the C++11 function-local-static
+// guarantee (thread-safe): this runs on the hot Metal submission path, and
+// std::getenv takes a process-wide libc lock and is not async-signal-safe, so a
+// single read is the correct contract for a static process-level knob.
+int read_inflight_limit() {
+  static const int limit = read_positive_env_int(
+      "MLX_METAL_MAX_INFLIGHT_PER_STREAM", std::numeric_limits<int>::max());
+  return limit;
+}
+
+// MLX_METAL_BACKPRESSURE_TIMEOUT_SECS: anti-deadlock deadline for the gate (not
+// the cap itself). Unset/invalid -> 30. Cached once — same rationale as above.
+int read_backpressure_timeout_secs() {
+  static const int timeout =
+      read_positive_env_int("MLX_METAL_BACKPRESSURE_TIMEOUT_SECS", 30);
+  return timeout;
+}
+
+} // namespace
 
 void init() {}
 
@@ -94,13 +141,28 @@ void eval(array& arr) {
 
   if (encoder.needs_commit()) {
     encoder.end_encoding();
+    const int limit = read_inflight_limit();
+    const bool backpressure_enabled = limit != std::numeric_limits<int>::max();
+    if (backpressure_enabled) {
+      // Throttle BEFORE notify_new_task so the in-flight slot and the
+      // active-task accounting stay consistent (acquire balances the
+      // completion handler's release; notify_new_task balances its
+      // notify_task_completion). Skipped entirely when the env var is unset.
+      scheduler::acquire_stream_slot(s, limit, read_backpressure_timeout_secs());
+    }
     scheduler::notify_new_task(s);
     command_buffer->addCompletedHandler(
-        [s, buffers = std::move(buffers)](MTL::CommandBuffer* cbuf) {
-          // Stash any error BEFORE signaling task completion so a thread woken
-          // by notify_task_completion is guaranteed to see the error on its
-          // next throw_if_stream_error waitpoint.
+        [s, backpressure_enabled, buffers = std::move(buffers)](
+            MTL::CommandBuffer* cbuf) {
+          // Stash any error BEFORE waking either waiter — both the
+          // back-pressure release and notify_task_completion can unblock a
+          // thread, and the #2670 ordering requires the error be visible
+          // before that thread reaches its next throw_if_stream_error
+          // waitpoint.
           stash_command_buffer_error(s, cbuf);
+          if (backpressure_enabled) {
+            scheduler::release_stream_slot(s);
+          }
           scheduler::notify_task_completion(s);
         });
     encoder.commit();
@@ -120,8 +182,19 @@ void finalize(Stream s) {
   auto& encoder = metal::get_command_encoder(s);
   auto* cb = encoder.get_command_buffer();
   encoder.end_encoding();
-  cb->addCompletedHandler(
-      [s](MTL::CommandBuffer* cbuf) { stash_command_buffer_error(s, cbuf); });
+  const int limit = read_inflight_limit();
+  const bool backpressure_enabled = limit != std::numeric_limits<int>::max();
+  if (backpressure_enabled) {
+    scheduler::acquire_stream_slot(s, limit, read_backpressure_timeout_secs());
+  }
+  cb->addCompletedHandler([s, backpressure_enabled](MTL::CommandBuffer* cbuf) {
+    // Stash before releasing the slot (see eval()'s handler) so a woken
+    // submitter sees the error at its next waitpoint.
+    stash_command_buffer_error(s, cbuf);
+    if (backpressure_enabled) {
+      scheduler::release_stream_slot(s);
+    }
+  });
   encoder.commit();
 }
 
