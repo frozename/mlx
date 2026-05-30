@@ -31,6 +31,7 @@ target_sources(
           ops_tests.cpp
           random_tests.cpp
           scheduler_tests.cpp
+          test_stream_error.cpp
           utils_tests.cpp
           vmap_tests.cpp
           linalg_tests.cpp
